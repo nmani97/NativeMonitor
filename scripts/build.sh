@@ -39,6 +39,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </dict></plist>
 EOF
 
+xattr -cr "$APP"
 codesign --force --sign "${SIGN_ID:--}" "$APP"
-(cd build && ditto -c -k --keepParent NativeMonitor.app ../dist/NativeMonitor.zip)
+(cd build && ditto -c -k --norsrc --noextattr --noacl --keepParent NativeMonitor.app ../dist/NativeMonitor.zip)
 echo "built $APP and dist/NativeMonitor.zip"
