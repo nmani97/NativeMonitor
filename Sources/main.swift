@@ -154,7 +154,19 @@ final class DDC {
     typealias I2C = @convention(c) (CFTypeRef, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> IOReturn
     private let create: Create?, write: I2C?, read: I2C?
     private let queue = DispatchQueue(label: "ddc")
+    private let lock = NSLock()
     private var pending: [String: Int] = [:]   // latest value per monitor+code: only the newest is sent
+    private var busySince: Date?               // set while an I2C call runs
+
+    /// A monitor that stops answering can leave an I2C call blocked in the kernel for good.
+    /// Then every DDC call is skipped: volume falls back to software, brightness keys go back to macOS.
+    var isStuck: Bool { lock.withLock { busySince.map { Date().timeIntervalSince($0) > ddcTimeout } ?? false } }
+
+    private func i2c<T>(_ body: () -> T) -> T {
+        lock.withLock { busySince = Date() }
+        defer { lock.withLock { busySince = nil } }
+        return body()
+    }
 
     init() {
         let h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW)
@@ -204,33 +216,47 @@ final class DDC {
     }
 
     func set(_ m: Monitor, _ vcp: UInt8, _ value: Int) {
+        guard !isStuck else { return }
         let key = "\(m.id)-\(vcp)"
-        queue.sync { pending[key] = value }
+        lock.withLock { pending[key] = value }   // never wait on `queue` here: this runs on the main thread
         queue.async { [self] in
-            guard let v = pending.removeValue(forKey: key), let write else { return }
+            guard let v = lock.withLock({ pending.removeValue(forKey: key) }), let write else { return }
             var d: [UInt8] = [0x84, 0x03, vcp, UInt8(v >> 8), UInt8(v & 0xFF), 0]
             d[5] = d[0..<5].reduce(0x6E ^ 0x51, ^)
-            for _ in 0..<2 { _ = write(m.service, 0x37, 0x51, &d, 6); usleep(10_000) }   // sent twice: monitors sometimes drop one
+            i2c { for _ in 0..<2 { _ = write(m.service, 0x37, 0x51, &d, 6); usleep(10_000) } }   // sent twice: monitors sometimes drop one
         }
     }
 
     /// (current, max), or nil when the monitor doesn't answer for this code.
     func get(_ m: Monitor, _ vcp: UInt8) -> (Int, Int)? {
-        queue.sync {
-            guard let write, let read else { return nil }
-            var q: [UInt8] = [0x82, 0x01, vcp, 0]
-            q[3] = q[0..<3].reduce(0x6E ^ 0x51, ^)
-            var r = [UInt8](repeating: 0, count: 12)
-            for _ in 0..<3 {
-                _ = write(m.service, 0x37, 0x51, &q, 4); usleep(50_000)
-                if read(m.service, 0x37, 0x51, &r, 12) == kIOReturnSuccess, r[2] == 0x02, r[3] == 0, r[4] == vcp {
-                    let max = Int(r[6]) << 8 | Int(r[7])
-                    return max > 0 ? (Int(r[8]) << 8 | Int(r[9]), max) : nil
-                }
-            }
-            return nil
-        }
+        guard !isStuck else { return nil }
+        return withTimeout(ddcTimeout, on: queue) { [self] in i2c { readNow(m, vcp) } } ?? nil
     }
+
+    private func readNow(_ m: Monitor, _ vcp: UInt8) -> (Int, Int)? {
+        guard let write, let read else { return nil }
+        var q: [UInt8] = [0x82, 0x01, vcp, 0]
+        q[3] = q[0..<3].reduce(0x6E ^ 0x51, ^)
+        var r = [UInt8](repeating: 0, count: 12)
+        for _ in 0..<3 {
+            _ = write(m.service, 0x37, 0x51, &q, 4); usleep(50_000)
+            if read(m.service, 0x37, 0x51, &r, 12) == kIOReturnSuccess, r[2] == 0x02, r[3] == 0, r[4] == vcp {
+                let max = Int(r[6]) << 8 | Int(r[7])
+                return max > 0 ? (Int(r[8]) << 8 | Int(r[9]), max) : nil
+            }
+        }
+        return nil
+    }
+}
+
+let ddcTimeout: TimeInterval = 2
+
+/// Runs `body` on `queue`; nil if it hasn't finished within `seconds` (it keeps running in the background).
+func withTimeout<T>(_ seconds: TimeInterval, on queue: DispatchQueue, _ body: @escaping () -> T) -> T? {
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: T?
+    queue.async { result = body(); done.signal() }
+    return done.wait(timeout: .now() + seconds) == .success ? result : nil
 }
 
 func screenName(_ id: CGDirectDisplayID) -> String {
@@ -553,6 +579,10 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(zip(ddcs, ddcs.dropFirst()).allSatisfy { $0 <= $1 }, "monitor volume not monotonic")
     // Monitor without DDC volume: everything in software, mute included.
     precondition(mapping(0.5, muted: false, max: nil) == (0, 0.125, true) && mapping(0.5, muted: true, max: nil).gain == 0)
+    // A hung call gives up after the timeout instead of blocking forever.
+    let t0 = Date()
+    precondition(withTimeout(0.2, on: DispatchQueue(label: "t")) { sleep(2); return 1 } == nil && Date().timeIntervalSince(t0) < 1)
+    precondition(withTimeout(1, on: DispatchQueue(label: "t2")) { 7 } == 7)
     print("selftest OK"); exit(0)
 }
 

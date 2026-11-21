@@ -3,7 +3,7 @@
 # Signs ad-hoc, or with $SIGN_ID (a code-signing identity) so macOS keeps permissions across rebuilds.
 set -euo pipefail
 cd "${0:A:h}/.."
-VERSION=1.0.0
+VERSION=1.0.1
 APP=build/NativeMonitor.app
 rm -rf build dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
 
